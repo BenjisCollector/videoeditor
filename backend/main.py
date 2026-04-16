@@ -1,25 +1,44 @@
 import os
+import json as _json
+import re
+import traceback
 from typing import Any
 
 from dotenv import load_dotenv
-import traceback
-import json as _json
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from google import genai
 from pydantic import BaseModel, ConfigDict
-import re
-from datetime import datetime, timedelta
 
-from schema import FunctionCallResponse, MediaBinItem, TimelineState
-from tools_registry import get_tools_catalog_json
+import anthropic
+
+from schema import FunctionCallResponse, UniversalToolCall
+from tools_registry import get_tools_catalog
 
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-5")
+ANTHROPIC_MAX_TOKENS = int(os.getenv("ANTHROPIC_MAX_TOKENS", "1024"))
 
 app = FastAPI()
-gemini_api = genai.Client(api_key=GEMINI_API_KEY)
+
+# The client is created lazily so an unset API key surfaces as a 500 from the
+# /ai endpoint rather than a startup crash, keeping other endpoints reachable
+# for smoke tests.
+_anthropic_client: anthropic.Anthropic | None = None
+
+
+def _get_client() -> anthropic.Anthropic:
+    global _anthropic_client
+    if _anthropic_client is None:
+        if not ANTHROPIC_API_KEY:
+            raise HTTPException(
+                status_code=500,
+                detail="ANTHROPIC_API_KEY is not set in environment",
+            )
+        _anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    return _anthropic_client
+
 
 # Enable CORS
 app.add_middleware(
@@ -111,7 +130,7 @@ def _normalize_time_fields_from_text(user_text: str, args: dict[str, Any]) -> di
 
     # Extract explicit FROM ... TO ... first
     # Use [0-9][0-9.]*[a-z]*(?:[ ][a-z]{1,12})? so the numeric, attached-unit, and
-    # separated-unit character classes are disjoint — no ambiguous matching, no ReDoS.
+    # separated-unit character classes are disjoint - no ambiguous matching, no ReDoS.
     m = re.search(r"from\s+([0-9][0-9.]*[a-z]*(?:[ ][a-z]{1,12})?)\s+to\s+([0-9][0-9.]*[a-z]*(?:[ ][a-z]{1,12})?)", text)
     if m:
         start_candidate = _to_seconds(m.group(1))
@@ -168,46 +187,153 @@ def _postprocess_response(user_text: str, resp: FunctionCallResponse) -> Functio
     return resp
 
 
-def _second_pass_force_tool(request: Message, assistant_note: str) -> FunctionCallResponse | None:
-    """If the first pass returned only assistant text, try a second pass that
-    explicitly asks for a single tool call when possible."""
-    try:
-        response_schema = {
-            "type": "object",
-            "properties": {
-                "function_call": {
-                    "type": "object",
-                    "properties": {
-                        "function_name": {"type": "string"},
-                        "arguments": {"type": "object", "properties": {}},
-                    },
-                    "required": ["function_name"],
-                },
-                "assistant_message": {"type": "string"},
-            },
-        }
-        response = gemini_api.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=f"""You previously drafted a plan:\n\n{assistant_note}\n\nNow convert the user's latest instruction into exactly one tool call if applicable.\nReturn strictly a JSON object with either function_call or assistant_message.\nAvailable tools:\n{get_tools_catalog_json()}\n\nUser message: {request.message}\nTimeline state: {request.timeline_state}\nMedia bin items: {request.mediabin_items}\n""",
-            config={
-                "response_mime_type": "application/json",
-                "response_schema": response_schema,
-            },
+def _tools_for_anthropic() -> list[dict[str, Any]]:
+    """Translate the provider-agnostic tool catalog into Anthropic tool-use shape.
+
+    Anthropic expects:
+        { "name": str, "description": str, "input_schema": JSONSchema }
+    The catalog entries already carry a JSON-Schema-like `arguments` dict; we
+    map `arguments -> input_schema` and pass `name`/`description` through.
+    """
+    tools: list[dict[str, Any]] = []
+    for entry in get_tools_catalog():
+        tools.append(
+            {
+                "name": entry["name"],
+                "description": entry.get("description", ""),
+                "input_schema": entry.get(
+                    "arguments", {"type": "object", "properties": {}}
+                ),
+            }
         )
-        text_payload = getattr(response, "text", None)
-        if text_payload:
-            data = _json.loads(text_payload)
-            return FunctionCallResponse.model_validate(data)
-    except Exception as e:
-        print("[AI] Second-pass error:", repr(e))
-    return None
+    return tools
+
+
+# A virtual tool that lets the model respond with free-form assistant text when
+# no concrete editor action applies. Having this as an explicit tool lets us
+# force `tool_choice={"type": "any"}` and still get a clarification path.
+_ASSISTANT_MESSAGE_TOOL: dict[str, Any] = {
+    "name": "AssistantMessage",
+    "description": (
+        "Respond with a short assistant message when no concrete editor "
+        "action applies, or when a clarifying question is required before "
+        "taking an action. Use for ambiguous requests only."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "message": {
+                "type": "string",
+                "description": "The assistant message to show to the user.",
+            }
+        },
+        "required": ["message"],
+    },
+}
+
+
+SYSTEM_PROMPT = """You are an AI assistant inside a video editor.
+
+You will decide between calling exactly one tool to perform a concrete
+edit, or calling the AssistantMessage tool with a short clarifying
+question when the request is ambiguous or cannot be fulfilled safely.
+
+Tool calling policy:
+- Call ONE tool only when the user's request is clear and safe to execute.
+- If ambiguous (e.g., no clear asset or time), call AssistantMessage with
+  a concise clarifying question.
+- Assume a single active timeline; do NOT require a timeline_id.
+- Tracks are named like "track-1", but users say "track 1" meaning 1-based
+  index.
+- Default pixels_per_second = 100 if not provided.
+- If user mentions items with @, prefer those exact assets (via
+  mentioned_scrubber_ids). Otherwise, map names by case-insensitive
+  substring to media bin items.
+
+Editing semantics for time and duration:
+- "at 2 sec" or "at 2s" -> start_seconds = 2.
+- "for 10 sec" -> duration_seconds = 10.
+- "from 2 sec for 10 sec" -> start_seconds = 2, duration_seconds = 10.
+- "from 2 sec to 12 sec" -> start_seconds = 2, end_seconds = 12.
+- If duration is omitted, use the media's intrinsic duration if available;
+  for images default to 5 seconds.
+
+Tool selection guidance:
+- If the user references @<asset>, call AddMediaById using
+  mentioned_scrubber_ids[0].
+- If the user references an asset by name (e.g., "cardboard"), call
+  AddMediaByName with scrubber_name="cardboard".
+- If user asks to make it span for N seconds, prefer AddMedia* with
+  duration_seconds.
+- If user says "from A sec to B sec", pass start_seconds=A and end_seconds=B.
+- For deletions like "remove everything on track 2", call
+  DeleteScrubbersInTrack with track_number=2.
+"""
+
+
+def _build_messages(request: Message) -> list[dict[str, Any]]:
+    """Convert the incoming request into Anthropic messages[] shape.
+
+    Prior chat history (if present) is replayed as alternating user/assistant
+    turns. The final user turn carries the structured editor context so the
+    model has the latest timeline + media-bin state when choosing a tool.
+    """
+    messages: list[dict[str, Any]] = []
+
+    for turn in request.chat_history or []:
+        role = turn.get("role")
+        content = turn.get("content")
+        if role in ("user", "assistant") and isinstance(content, str) and content:
+            messages.append({"role": role, "content": content})
+
+    user_body = (
+        f"User message: {request.message}\n"
+        f"Mentioned scrubber ids: {request.mentioned_scrubber_ids}\n"
+        f"Timeline state: {_json.dumps(request.timeline_state, separators=(',', ':')) if request.timeline_state is not None else 'null'}\n"
+        f"Media bin items: {_json.dumps(request.mediabin_items, separators=(',', ':')) if request.mediabin_items is not None else 'null'}\n"
+    )
+    messages.append({"role": "user", "content": user_body})
+    return messages
+
+
+def _extract_tool_use(response: Any) -> tuple[str | None, dict[str, Any] | None, str | None]:
+    """Pull the first tool_use block (if any) and any trailing text out of the
+    Anthropic response.
+
+    Returns: (tool_name, tool_input, text_fallback)
+    """
+    tool_name: str | None = None
+    tool_input: dict[str, Any] | None = None
+    text_fallback: str | None = None
+
+    for block in getattr(response, "content", []) or []:
+        btype = getattr(block, "type", None)
+        if btype == "tool_use" and tool_name is None:
+            tool_name = getattr(block, "name", None)
+            raw_input = getattr(block, "input", {}) or {}
+            tool_input = dict(raw_input) if isinstance(raw_input, dict) else {}
+        elif btype == "text" and text_fallback is None:
+            text_fallback = getattr(block, "text", None)
+
+    return tool_name, tool_input, text_fallback
+
+
+def _response_from_tool(tool_name: str, tool_input: dict[str, Any] | None) -> FunctionCallResponse:
+    if tool_name == _ASSISTANT_MESSAGE_TOOL["name"]:
+        msg = (tool_input or {}).get("message") or ""
+        return FunctionCallResponse(assistant_message=str(msg))
+    return FunctionCallResponse(
+        function_call=UniversalToolCall(
+            function_name=tool_name,
+            arguments=tool_input or {},
+        )
+    )
 
 
 @app.post("/ai")
 async def process_ai_message(request: Message) -> FunctionCallResponse:
     try:
-        if not GEMINI_API_KEY:
-            raise HTTPException(status_code=500, detail="GEMINI_API_KEY is not set in environment")
+        client = _get_client()
 
         # Debug: incoming request summary
         try:
@@ -224,175 +350,50 @@ async def process_ai_message(request: Message) -> FunctionCallResponse:
         except Exception:
             pass
 
-        # Minimal Gemini-compatible response schema (no additionalProperties, no unions)
-        response_schema = {
-            "type": "object",
-            "properties": {
-                "function_call": {
-                    "type": "object",
-                    "properties": {
-                        "function_name": {"type": "string"},
-                        "arguments": {
-                            "type": "object",
-                            "properties": {
-                                # Generic placement/move
-                                "scrubber_id": {"type": "string"},
-                                "track_number": {"type": "integer"},
-                                "track_id": {"type": "string"},
-                                "start_seconds": {"type": "number"},
-                                "position_seconds": {"type": "number"},
-                                "drop_left_px": {"type": "integer"},
-                                "duration_seconds": {"type": "number"},
-                                "end_seconds": {"type": "number"},
-                                "pixels_per_second": {"type": "integer"},
-                                "scrubber_name": {"type": "string"},
-                                "new_position_seconds": {"type": "number"},
-                                "new_track_number": {"type": "integer"},
-                                "scrubber_ids": {"type": "array", "items": {"type": "string"}},
-                                "offset_seconds": {"type": "number"},
-                                # Text styling/content
-                                "new_text_content": {"type": "string"},
-                                "fontSize": {"type": "integer"},
-                                "fontFamily": {"type": "string"},
-                                "color": {"type": "string"},
-                                "textAlign": {"type": "string"},
-                                "fontWeight": {"type": "string"},
-                                # Composition settings
-                                "width": {"type": "integer"},
-                                "height": {"type": "integer"},
-                                "auto": {"type": "boolean"},
-                            },
-                        },
-                    },
-                    "required": ["function_name"],
-                },
-                "assistant_message": {"type": "string"},
-            },
-        }
+        tools = _tools_for_anthropic() + [_ASSISTANT_MESSAGE_TOOL]
+        messages = _build_messages(request)
 
-        response = gemini_api.models.generate_content(
-             model="gemini-2.5-flash",
-             contents=f"""You are Kimu, an AI assistant inside a video editor.
-
-            You will return a JSON object with either:
-            - function_call: {{"function_name": string, "arguments": object}}  [V2 universal schema]
-            - assistant_message: string (when no action is needed or a clarification is required)
-
-            Available tools (names and schemas):
-            {get_tools_catalog_json()}
-
-            Tool calling policy:
-            - Call ONE tool only when the user's request is clear and safe to execute.
-            - If ambiguous (e.g., no clear asset or time), return an assistant_message that asks a concise clarifying question.
-            - Assume a single active timeline; do NOT require a timeline_id.
-            - Tracks are named like "track-1", but users say "track 1" meaning 1-based index.
-            - Default pixels_per_second = 100 if not provided.
-            - If user mentions items with @, prefer those exact assets (via mentioned_scrubber_ids). Otherwise, map names by case-insensitive substring to media bin items.
-
-            Editing semantics for time and duration:
-            - "at 2 sec" or "at 2s" → start_seconds = 2.
-            - "for 10 sec" → duration_seconds = 10.
-            - "from 2 sec for 10 sec" → start_seconds = 2, duration_seconds = 10.
-            - "from 2 sec to 12 sec" → start_seconds = 2, end_seconds = 12.
-            - If duration is omitted, use the media's intrinsic duration if available; for images default to 5 seconds.
-
-            
-
-            Tool selection guidance:
-            - If the user references @<asset>, call AddMediaById using mentioned_scrubber_ids[0].
-            - If the user references an asset by name (e.g., "cardboard"), call AddMediaByName with scrubber_name="cardboard".
-            - If user asks to make it span for N seconds, prefer AddMedia* with duration_seconds.
-            - If user says "from A sec to B sec", pass start_seconds=A and end_seconds=B.
-            - For deletions like "remove everything on track 2", call DeleteScrubbersInTrack with track_number=2.
- 
-             Conversation so far (oldest first): {request.chat_history}
- 
-             User message: {request.message}
-             Mentioned scrubber ids: {request.mentioned_scrubber_ids}
-             Timeline state: {request.timeline_state}
-             Media bin items: {request.mediabin_items}
-             """,
-             config={
-                 "response_mime_type": "application/json",
-                 "response_schema": response_schema,
-             },
-         
+        response = client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=ANTHROPIC_MAX_TOKENS,
+            system=SYSTEM_PROMPT,
+            tools=tools,
+            # Force the model to call one of the available tools (which
+            # includes AssistantMessage for ambiguous cases). Matches the
+            # prior contract: always return either function_call or
+            # assistant_message.
+            tool_choice={"type": "any"},
+            messages=messages,
         )
-        # Debug: response object summary
+
         try:
-            print("[AI] Raw response type:", type(response))
-            # Some SDK versions expose .to_dict() or .candidates; print defensively
-            cand = getattr(response, "candidates", None)
-            if cand is not None:
-                print("[AI] candidates len:", len(cand))
-            text_preview = getattr(response, "text", None)
-            if isinstance(text_preview, str):
-                print("[AI] text preview:", text_preview[:200])
+            print(
+                "[AI] Response summary:",
+                {
+                    "stop_reason": getattr(response, "stop_reason", None),
+                    "content_blocks": len(getattr(response, "content", []) or []),
+                },
+            )
         except Exception:
             pass
 
-        # Robust parsing across SDK versions
-        parsed = getattr(response, "parsed", None)
-        if parsed is not None:
-            try:
-                if isinstance(parsed, dict):
-                    resp = FunctionCallResponse.model_validate(parsed)
-                    return _postprocess_response(request.message, resp)
-                # Some SDKs may return an object with attribute access
-                maybe_name = getattr(parsed, "function_call", None)
-                maybe_msg = getattr(parsed, "assistant_message", None)
-                if maybe_name is not None or maybe_msg is not None:
-                    as_dict = {}
-                    if maybe_name is not None:
-                        # function_call may itself be an object with attrs
-                        fn = getattr(parsed.function_call, "function_name", None)
-                        args = getattr(parsed.function_call, "arguments", None)
-                        if args is None:
-                            # also try dict-like
-                            args = getattr(parsed.function_call, "get", lambda k, d=None: None)("arguments", None)
-                        as_dict["function_call"] = {
-                            "function_name": fn,
-                            "arguments": args or {},
-                        }
-                    if maybe_msg is not None:
-                        as_dict["assistant_message"] = maybe_msg
-                    if as_dict:
-                        resp = FunctionCallResponse.model_validate(as_dict)
-                        # If no tool chosen, attempt a second pass
-                        if resp.function_call is None and resp.assistant_message:
-                            forced = _second_pass_force_tool(request, resp.assistant_message)
-                            if forced is not None:
-                                return _postprocess_response(request.message, forced)
-                        return _postprocess_response(request.message, resp)
-            except Exception:
-                pass
+        tool_name, tool_input, text_fallback = _extract_tool_use(response)
 
-        # Fallback: try JSON text
-        text_payload = getattr(response, "text", None)
-        if text_payload:
-            try:
-                data = _json.loads(text_payload)
-                resp = FunctionCallResponse.model_validate(data)
-                # If no tool chosen, try second pass using the assistant text
-                if resp.function_call is None and resp.assistant_message:
-                    forced = _second_pass_force_tool(request, resp.assistant_message)
-                    if forced is not None:
-                        return _postprocess_response(request.message, forced)
-                return _postprocess_response(request.message, resp)
-            except Exception as e:  # noqa: BLE001
-                raise HTTPException(status_code=500, detail=f"Invalid JSON from model: {e}") from e
+        if tool_name is not None:
+            resp = _response_from_tool(tool_name, tool_input)
+            return _postprocess_response(request.message, resp)
 
-        # As a last resort, try to serialize the response to dict if available
-        try:
-            to_dict = getattr(response, "to_dict", None)
-            if callable(to_dict):
-                data = to_dict()
-                resp = FunctionCallResponse.model_validate(data)
-                return _postprocess_response(request.message, resp)
-        except Exception:
-            pass
+        # Fallback: the model responded with only free-form text. Surface it
+        # as an assistant_message so the frontend can render it unchanged.
+        if text_fallback:
+            return FunctionCallResponse(assistant_message=text_fallback)
 
-        raise HTTPException(status_code=500, detail="Model returned no parseable content; enable debug logs for details")
+        raise HTTPException(
+            status_code=500,
+            detail="Model returned no tool call and no text; enable debug logs for details",
+        )
+    except HTTPException:
+        raise
     except Exception as e:
         # Print full traceback for debugging
         print("[AI] Error:", repr(e))

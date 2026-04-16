@@ -91,7 +91,7 @@ pnpm run dev                                    # Frontend (port 5173)
 pnpm dlx tsx app/videorender/videorender.ts     # Backend (port 8000)
 uv run backend/main.py                          # FastAPI (port 3000)
 
-# Note: You'll need GEMINI_API_KEY for AI features
+# Note: You'll need ANTHROPIC_API_KEY for AI features
 ```
 
 `Requirements`
@@ -143,7 +143,7 @@ GOOGLE_CLIENT_ID=your_google_client_id
 GOOGLE_CLIENT_SECRET=your_google_client_secret
 
 # AI Features (Optional -> /backend)
-GEMINI_API_KEY=your_gemini_api_key
+ANTHROPIC_API_KEY=your_anthropic_api_key
 
 # Supabase (Optional)
 VITE_SUPABASE_URL=your_supabase_url
@@ -155,7 +155,7 @@ VITE_SUPABASE_ANON_KEY=your_supabase_key
 - `PROD_DOMAIN`: Your production domain (host only, e.g., `yourdomain.com`)
 - `DATABASE_URL`: PostgreSQL connection string
 - `GOOGLE_CLIENT_ID/SECRET`: Google OAuth credentials for authentication
-- `GEMINI_API_KEY`: Required for AI-powered video editing features
+- `ANTHROPIC_API_KEY`: Required for AI-powered video editing features
 - `VITE_SUPABASE_*`: Optional Supabase integration for additional features
 
 <br>
