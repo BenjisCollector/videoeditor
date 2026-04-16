@@ -1,0 +1,22 @@
+{
+  "name": "agentic-sidecar",
+  "private": true,
+  "version": "0.0.1",
+  "description": "Local, non-distributed sidecar for the agentic editing loop: watches diff-log.jsonl and invokes the claude-code CLI to extract editing preferences. Intentionally outside the AGPL editor's distribution graph.",
+  "type": "module",
+  "scripts": {
+    "extract": "tsx src/extract-preferences.ts",
+    "watch": "tsx src/watch.ts"
+  },
+  "dependencies": {
+    "chokidar": "^4.0.1",
+    "execa": "^9.4.0",
+    "zod": "4.0.9"
+  },
+  "devDependencies": {
+    "tsx": "^4.20.4",
+    "typescript": "^5.8.3",
+    "@types/node": "^24.1.0"
+  },
+  "license": "UNLICENSED"
+}
