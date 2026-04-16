@@ -19,7 +19,11 @@ services:
       AUTH_COOKIE_DOMAIN: localhost
       NODE_ENV: development
     ports:
-      - "5173:5173"
+      # Loopback-only bind: dev stack must not be reachable off-host.
+      # This avoids accidentally exposing the editor over the network; any
+      # cross-host access should go through an explicit, intentional reverse
+      # proxy (not this default dev compose file).
+      - "127.0.0.1:5173:5173"
     depends_on:
       - backend
 
@@ -38,11 +42,13 @@ services:
       AUTH_COOKIE_DOMAIN: localhost
       NODE_ENV: development
     ports:
-      - "8000:8000"
+      # Loopback-only bind (see frontend note above).
+      - "127.0.0.1:8000:8000"
 
   fastapi:
     ports:
-      - "3000:3000"
+      # Loopback-only bind (see frontend note above).
+      - "127.0.0.1:3000:3000"
     build:
       context: ./backend
       dockerfile: Dockerfile
