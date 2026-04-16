@@ -69,3 +69,9 @@ learn.json
 .mypy_cache/
 idk.tsx
 idk.ts
+
+# Agentic sidecar: proprietary tooling (claude-code CLI wrappers, agent
+# SDKs under commercial terms, local watchers). Kept out of distribution
+# entirely so the AGPL-licensed editor never links against non-compatible
+# code. Lives on an integration branch, never on the PR-bound branch.
+/tools/agentic/
