@@ -15,7 +15,14 @@ export default defineConfig({
     projects: [
       "./packages/schema/vitest.config.ts",
       ...agenticProject,
-      // app-level project configs added in Wave 2/4 when hook/component tests land
+      // Pure-TS lib tests (no React/DOM yet — add happy-dom project when hooks land)
+      {
+        test: {
+          name: "app-lib",
+          include: ["app/lib/agentic-mode/tests/**/*.spec.ts"],
+          globals: true,
+        },
+      },
     ],
   },
 });
