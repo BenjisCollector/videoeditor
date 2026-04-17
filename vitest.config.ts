@@ -15,11 +15,20 @@ export default defineConfig({
     projects: [
       "./packages/schema/vitest.config.ts",
       ...agenticProject,
-      // Pure-TS lib tests (no React/DOM yet — add happy-dom project when hooks land)
+      // Pure-TS lib tests
       {
         test: {
           name: "app-lib",
           include: ["app/lib/agentic-mode/tests/**/*.spec.ts"],
+          globals: true,
+        },
+      },
+      // React hook tests — happy-dom + @testing-library/react
+      {
+        test: {
+          name: "app-hooks",
+          environment: "happy-dom",
+          include: ["app/hooks/tests/**/*.spec.ts"],
           globals: true,
         },
       },
