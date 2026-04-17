@@ -75,3 +75,9 @@ idk.ts
 # entirely so the AGPL-licensed editor never links against non-compatible
 # code. Lives on an integration branch, never on the PR-bound branch.
 /tools/agentic/
+# vitest
+coverage/
+.vitest-cache/
+
+# pytest
+.pytest_cache/

@@ -27,5 +27,9 @@
   "dependencies": {
     "zod": "4.0.9"
   },
+  "scripts": {
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest"
+  },
   "license": "SEE LICENSE IN ../../LICENSE.md"
 }
